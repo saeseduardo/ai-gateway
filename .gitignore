@@ -1,0 +1,24 @@
+# Binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test / coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Environment
+.env
+.env.*
+
+# Go workspace / build cache
+/vendor/
+
+# IDE
+.idea/
+.vscode/
