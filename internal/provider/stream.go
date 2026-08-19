@@ -20,8 +20,12 @@ type StreamReader interface {
 type StreamChunk struct {
 	// Delta is the incremental content produced since the previous
 	// chunk. It is empty on chunks that carry no new content (e.g. a
-	// final chunk that only reports Usage).
+	// final chunk that only reports FinishReason or Usage).
 	Delta string
+	// FinishReason indicates why generation stopped (e.g. "stop",
+	// "length"), as normalized/reported by the provider. It is empty
+	// on every chunk except the final one.
+	FinishReason string
 	// Usage reports token accounting for the request. It is nil on
 	// every chunk except, for providers that report it, the final one.
 	Usage *Usage
