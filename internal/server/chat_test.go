@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -148,6 +149,32 @@ func (b *blockingStreamReader) Recv() (*provider.StreamChunk, error) {
 func (b *blockingStreamReader) Close() error {
 	b.closeCount.Add(1)
 	b.closeOnce.Do(func() { close(b.closeCh) })
+	return nil
+}
+
+// erroringStreamReader replays a fixed sequence of chunks, then
+// returns failErr (which must not be io.EOF) on every subsequent Recv
+// call, simulating an upstream failure that happens after streaming
+// has already begun (e.g. the provider drops the connection or sends
+// something unparseable).
+type erroringStreamReader struct {
+	chunks  []*provider.StreamChunk
+	failErr error
+	idx     int
+	closed  bool
+}
+
+func (e *erroringStreamReader) Recv() (*provider.StreamChunk, error) {
+	if e.idx < len(e.chunks) {
+		c := e.chunks[e.idx]
+		e.idx++
+		return c, nil
+	}
+	return nil, e.failErr
+}
+
+func (e *erroringStreamReader) Close() error {
+	e.closed = true
 	return nil
 }
 
@@ -647,5 +674,164 @@ func TestChatCompletions_Streaming_LogsLifecycleEvents(t *testing.T) {
 	}
 	if strings.Contains(logs, `"msg":"stream_cancelled_by_client"`) {
 		t.Errorf("happy path must not log stream_cancelled_by_client: %s", logs)
+	}
+}
+
+// TestChatCompletions_Streaming_ErrorMidStream covers the subtle case
+// this step closes out the streaming module with: an upstream failure
+// that happens AFTER the 200 status and some "data:" frames have
+// already been written, when the HTTP status can no longer change.
+// The fake stream serves two good chunks and then fails, and the test
+// verifies the failure is reported inside the stream itself -- an
+// error frame followed by [DONE] -- rather than as an HTTP error
+// status, which is no longer possible at that point.
+func TestChatCompletions_Streaming_ErrorMidStream(t *testing.T) {
+	srv, logBuf := newTestServerWithLogBuffer()
+
+	stream := &erroringStreamReader{
+		chunks: []*provider.StreamChunk{
+			{Delta: "hello "},
+			{Delta: "world"},
+		},
+		failErr: errors.New("upstream connection reset"),
+	}
+	fp := &fakeProvider{
+		name: "fake",
+		chatCompletionStream: func(ctx context.Context, req *provider.ChatRequest) (provider.StreamReader, error) {
+			return stream, nil
+		},
+	}
+
+	rt := router.New()
+	rt.Register("gpt-4o", fp)
+	srv.RegisterChatRoutes(rt)
+
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(rec, req)
+
+	// The status must still be 200: SSE headers were already committed
+	// by the time the failure happened, so there is no way to change
+	// it -- this is the core assertion of this test.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (SSE headers were already committed, the status cannot change on a mid-stream failure), body=%s", rec.Code, rec.Body.String())
+	}
+
+	raw := strings.TrimRight(rec.Body.String(), "\n")
+	var blocks []string
+	for _, b := range strings.Split(raw, "\n\n") {
+		if strings.TrimSpace(b) != "" {
+			blocks = append(blocks, b)
+		}
+	}
+	if len(blocks) != 4 {
+		t.Fatalf("got %d SSE blocks, want 4 (2 chunks + 1 error frame + [DONE]): %v", len(blocks), blocks)
+	}
+
+	var texts []string
+	for i, b := range blocks[:2] {
+		payload, ok := strings.CutPrefix(b, "data: ")
+		if !ok {
+			t.Fatalf("block %d missing %q prefix: %q", i, "data: ", b)
+		}
+		var chunk api.ChatStreamChunk
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("unmarshal chunk %d %q: %v", i, payload, err)
+		}
+		texts = append(texts, chunk.Choices[0].Delta.Content)
+	}
+	if got := strings.Join(texts, ""); got != "hello world" {
+		t.Errorf("chunk text = %q, want %q", got, "hello world")
+	}
+
+	errPayload, ok := strings.CutPrefix(blocks[2], "data: ")
+	if !ok {
+		t.Fatalf("error block missing %q prefix: %q", "data: ", blocks[2])
+	}
+	var errBody errorBody
+	if err := json.Unmarshal([]byte(errPayload), &errBody); err != nil {
+		t.Fatalf("unmarshal error frame %q: %v", errPayload, err)
+	}
+	if errBody.Error.Message == "" {
+		t.Error("error frame message is empty")
+	}
+	if errBody.Error.Type != "internal_error" {
+		t.Errorf("error frame type = %q, want %q", errBody.Error.Type, "internal_error")
+	}
+
+	if blocks[3] != "data: [DONE]" {
+		t.Errorf("last block = %q, want %q (client must be able to tell the stream ended, even though it ended by failure)", blocks[3], "data: [DONE]")
+	}
+
+	if !stream.closed {
+		t.Error("StreamReader was not closed after the mid-stream error")
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, `"msg":"stream_failed"`) {
+		t.Errorf("logs do not contain a stream_failed event: %s", logs)
+	}
+	if !strings.Contains(logs, `"level":"ERROR"`) {
+		t.Errorf("stream_failed must be logged at Error level: %s", logs)
+	}
+	if !strings.Contains(logs, `"chunks_emitted":2`) {
+		t.Errorf("stream_failed log does not report chunks_emitted=2: %s", logs)
+	}
+	if strings.Contains(logs, `"msg":"stream_completed"`) {
+		t.Errorf("a mid-stream failure must not also log stream_completed: %s", logs)
+	}
+	if strings.Contains(logs, `"msg":"stream_cancelled_by_client"`) {
+		t.Errorf("a mid-stream failure must not be logged as a client cancellation: %s", logs)
+	}
+}
+
+func TestClassifyProviderError(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantType   string
+	}{
+		{
+			name:       "rate limited",
+			err:        &provider.ProviderError{Provider: "fake", StatusCode: http.StatusTooManyRequests, Retryable: true, Err: provider.ErrRateLimited},
+			wantStatus: http.StatusTooManyRequests,
+			wantType:   "rate_limited",
+		},
+		{
+			name:       "invalid request",
+			err:        &provider.ProviderError{Provider: "fake", StatusCode: http.StatusBadRequest, Err: provider.ErrInvalidRequest},
+			wantStatus: http.StatusBadRequest,
+			wantType:   "invalid_request",
+		},
+		{
+			name:       "provider unavailable",
+			err:        &provider.ProviderError{Provider: "fake", StatusCode: http.StatusServiceUnavailable, Retryable: true, Err: provider.ErrProviderUnavailable},
+			wantStatus: http.StatusBadGateway,
+			wantType:   "provider_unavailable",
+		},
+		{
+			name:       "generic non-provider error",
+			err:        errors.New("boom"),
+			wantStatus: http.StatusInternalServerError,
+			wantType:   "internal_error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, errType, message := classifyProviderError(tt.err)
+			if status != tt.wantStatus {
+				t.Errorf("status = %d, want %d", status, tt.wantStatus)
+			}
+			if errType != tt.wantType {
+				t.Errorf("errType = %q, want %q", errType, tt.wantType)
+			}
+			if message == "" {
+				t.Error("message is empty")
+			}
+		})
 	}
 }

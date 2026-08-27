@@ -115,6 +115,26 @@ func (s *Server) handleChatCompletions(rt *router.Router) http.HandlerFunc {
 // "stream_cancelled_by_client" at Info level: an expected, clean
 // shutdown, not a failure worth an Error log or (were it possible at
 // this point) a 500.
+//
+// A third outcome is an upstream failure mid-stream (Recv returns an
+// error that is neither io.EOF nor client cancellation — e.g. the
+// provider drops the connection, sends an unparseable chunk, or fails
+// with a late 5xx after already having started streaming). By this
+// point the 200 status and SSE headers are already committed, so
+// unlike the pre-stream failures above, this can no longer be
+// reported as an HTTP error status — attempting to would either be a
+// no-op or panic on the underlying ResponseWriter. Instead it is
+// reported inside the stream: one SSE "data:" frame carrying this
+// package's normal error JSON shape (see errorBody/errorDetail, the
+// same shape writeError uses), immediately followed by the standard
+// "data: [DONE]\n\n" sentinel, so the client can distinguish "the
+// model finished" from "the stream broke" without needing a status
+// code. This is logged as "stream_failed" at Error level.
+//
+// So there are exactly three terminal log events for a stream, letting
+// them be told apart in logs/metrics: stream_completed (clean EOF),
+// stream_cancelled_by_client (context cancelled), stream_failed
+// (upstream error after streaming had already begun).
 func (s *Server) streamChatCompletions(w http.ResponseWriter, r *http.Request, p provider.Provider, req *provider.ChatRequest) {
 	sw, err := newSSEWriter(w)
 	if err != nil {
@@ -171,11 +191,21 @@ func (s *Server) streamChatCompletions(w http.ResponseWriter, r *http.Request, p
 					)
 					return
 				}
-				// Headers and a 200 status are already committed at this
-				// point, so an upstream failure mid-stream can only be
-				// surfaced by logging and closing the connection early —
-				// there is no HTTP-level error status left to send.
-				s.logger.Error("stream read failed", "error", res.err, "request_id", reqID)
+
+				s.logger.Error("stream_failed",
+					"error", res.err,
+					"request_id", reqID,
+					"chunks_emitted", chunksEmitted,
+				)
+
+				_, errType, message := classifyProviderError(res.err)
+				if err := sw.WriteEvent(errorBody{Error: errorDetail{Message: message, Type: errType}}); err != nil {
+					s.logger.Error("stream error frame write failed", "error", err, "request_id", reqID)
+					return
+				}
+				if err := sw.WriteDone(); err != nil {
+					s.logger.Error("stream write failed", "error", err, "request_id", reqID)
+				}
 				return
 			}
 
@@ -223,27 +253,42 @@ func recvAsync(stream provider.StreamReader) <-chan streamRecvResult {
 	return ch
 }
 
-// writeProviderError maps an error returned by a provider.Provider to
-// this package's standard error JSON shape and an appropriate HTTP
-// status, using the same status family the provider originally saw
-// (rate limit, invalid request, or unavailable/unknown).
-func (s *Server) writeProviderError(w http.ResponseWriter, err error) {
+// classifyProviderError maps err to the HTTP status, this package's
+// error "type" tag, and a client-safe message, using the same status
+// family the provider originally saw (rate limit, invalid request, or
+// unavailable/unknown). A non-ProviderError is treated as an
+// unexpected internal failure: its message is not included in the
+// result, since it may contain internal detail not meant for
+// clients — callers should log err themselves if they want it
+// recorded.
+//
+// This is shared by the two places a provider error needs reporting:
+// writeProviderError, when the failure happens before any response
+// bytes are sent and a real HTTP status is still possible, and
+// streamChatCompletions' mid-stream error frame, when it isn't. Both
+// surfaces should describe the same error the same way.
+func classifyProviderError(err error) (status int, errType string, message string) {
 	var perr *provider.ProviderError
 	if errors.As(err, &perr) {
-		status := http.StatusBadGateway
-		errType := "provider_unavailable"
 		switch {
 		case errors.Is(perr, provider.ErrRateLimited):
-			status = http.StatusTooManyRequests
-			errType = "rate_limited"
+			return http.StatusTooManyRequests, "rate_limited", perr.Error()
 		case errors.Is(perr, provider.ErrInvalidRequest):
-			status = http.StatusBadRequest
-			errType = "invalid_request"
+			return http.StatusBadRequest, "invalid_request", perr.Error()
+		default:
+			return http.StatusBadGateway, "provider_unavailable", perr.Error()
 		}
-		writeError(w, status, perr.Error(), errType)
-		return
 	}
+	return http.StatusInternalServerError, "internal_error", "internal server error"
+}
 
-	s.logger.Error("unexpected provider error", "error", err)
-	writeError(w, http.StatusInternalServerError, "internal server error", "internal_error")
+// writeProviderError maps an error returned by a provider.Provider to
+// this package's standard error JSON shape and an appropriate HTTP
+// status via classifyProviderError.
+func (s *Server) writeProviderError(w http.ResponseWriter, err error) {
+	status, errType, message := classifyProviderError(err)
+	if errType == "internal_error" {
+		s.logger.Error("unexpected provider error", "error", err)
+	}
+	writeError(w, status, message, errType)
 }
