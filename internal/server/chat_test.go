@@ -1,19 +1,41 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/saeseduardo/ai-gateway/internal/api"
+	"github.com/saeseduardo/ai-gateway/internal/config"
 	"github.com/saeseduardo/ai-gateway/internal/provider"
 	"github.com/saeseduardo/ai-gateway/internal/router"
 )
+
+// newTestServerWithLogBuffer is like newTestServer, but captures log
+// output as JSON lines in the returned buffer instead of discarding
+// it, so tests can assert on specific log events (e.g.
+// stream_cancelled_by_client) and their fields.
+func newTestServerWithLogBuffer() (*Server, *bytes.Buffer) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	cfg := config.ServerConfig{
+		Port:            0,
+		ReadTimeout:     time.Second,
+		WriteTimeout:    time.Second,
+		IdleTimeout:     time.Second,
+		ShutdownTimeout: time.Second,
+	}
+	return New(cfg, logger), &buf
+}
 
 // fakeProvider is a provider.Provider stub whose behavior is
 // configured per test via its function fields.
@@ -78,6 +100,54 @@ func (s *slowStreamReader) Recv() (*provider.StreamChunk, error) {
 
 func (s *slowStreamReader) Close() error {
 	s.closed = true
+	return nil
+}
+
+// blockingStreamReader serves a fixed sequence of chunks immediately,
+// then blocks in Recv() -- simulating a provider that has gone quiet
+// mid-stream -- until Close() is called, at which point the pending
+// (and any future) Recv() returns io.EOF. This lets a test control
+// precisely when, if ever, another chunk becomes available, so
+// cancellation can be exercised deterministically instead of racing a
+// real chunk arrival.
+//
+// served is signaled once per chunk actually handed back by Recv, so
+// a test can wait for "the handler has consumed chunk N" without a
+// sleep. closeCount lets a test verify Close was actually called
+// (the cancellation contract this type exists to test), and is an
+// atomic since Close and Recv observably run on different goroutines.
+type blockingStreamReader struct {
+	chunks []*provider.StreamChunk
+	idx    int
+	served chan struct{}
+
+	closeCh    chan struct{}
+	closeOnce  sync.Once
+	closeCount atomic.Int32
+}
+
+func newBlockingStreamReader(chunks []*provider.StreamChunk) *blockingStreamReader {
+	return &blockingStreamReader{
+		chunks:  chunks,
+		served:  make(chan struct{}, len(chunks)),
+		closeCh: make(chan struct{}),
+	}
+}
+
+func (b *blockingStreamReader) Recv() (*provider.StreamChunk, error) {
+	if b.idx < len(b.chunks) {
+		c := b.chunks[b.idx]
+		b.idx++
+		b.served <- struct{}{}
+		return c, nil
+	}
+	<-b.closeCh
+	return nil, io.EOF
+}
+
+func (b *blockingStreamReader) Close() error {
+	b.closeCount.Add(1)
+	b.closeOnce.Do(func() { close(b.closeCh) })
 	return nil
 }
 
@@ -437,5 +507,145 @@ func TestChatCompletions_Streaming_Heartbeat(t *testing.T) {
 	}
 	if !stream.closed {
 		t.Error("StreamReader was not closed")
+	}
+}
+
+// TestChatCompletions_Streaming_CancelledByClient is the most
+// important test in this package: it proves the gateway's central
+// cost-control property, that when a client disconnects mid-stream,
+// the upstream provider connection is cut immediately rather than
+// left running (and being paid for) with nobody left to read it.
+//
+// The fake StreamReader serves exactly one chunk and then blocks in
+// Recv (simulating a provider that has gone quiet) until Close is
+// called. The test waits for that one chunk to be served, cancels the
+// request's context (simulating the client closing the connection),
+// and then asserts, all within a timeout so a regression that makes
+// the handler hang fails the test instead of blocking forever:
+//
+//   - the handler returns promptly instead of hanging,
+//   - StreamReader.Close was called (which is what tears down the
+//     upstream HTTP connection to the provider),
+//   - exactly one "data:" frame was written -- the chunk served
+//     before cancellation, and nothing after,
+//   - the response never reaches a normal [DONE] completion,
+//   - the response status is still 200 (headers were already
+//     committed; cancellation is not reported as an HTTP error),
+//   - a "stream_cancelled_by_client" event is logged at Info level
+//     with the request's ID and the correct emitted-chunk count.
+func TestChatCompletions_Streaming_CancelledByClient(t *testing.T) {
+	srv, logBuf := newTestServerWithLogBuffer()
+	srv.SetSSEHeartbeatInterval(time.Hour) // keep the heartbeat out of this test's way
+
+	stream := newBlockingStreamReader([]*provider.StreamChunk{{Delta: "chunk-1"}})
+	fp := &fakeProvider{
+		name: "fake",
+		chatCompletionStream: func(ctx context.Context, req *provider.ChatRequest) (provider.StreamReader, error) {
+			return stream, nil
+		},
+	}
+
+	rt := router.New()
+	rt.Register("gpt-4o", fp)
+	srv.RegisterChatRoutes(rt)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		srv.Router().ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	select {
+	case <-stream.served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the fake stream to serve its first chunk")
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after the client's request context was cancelled -- it hung")
+	}
+
+	if got := stream.closeCount.Load(); got == 0 {
+		t.Error("StreamReader.Close() was not called after cancellation -- the upstream connection would be left open")
+	}
+
+	respBody := rec.Body.String()
+	if got := strings.Count(respBody, "data: "); got != 1 {
+		t.Errorf("wrote %d \"data:\" frames, want exactly 1 (the chunk served before cancellation, none after): %q", got, respBody)
+	}
+	if strings.Contains(respBody, "[DONE]") {
+		t.Errorf("response contains [DONE], want the stream to end via cancellation, not normal completion: %q", respBody)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (SSE headers were already committed before cancellation, so it can't become an error status)", rec.Code)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, `"msg":"stream_cancelled_by_client"`) {
+		t.Errorf("logs do not contain a stream_cancelled_by_client event: %s", logs)
+	}
+	if !strings.Contains(logs, `"chunks_emitted":1`) {
+		t.Errorf("stream_cancelled_by_client log does not report chunks_emitted=1: %s", logs)
+	}
+	if strings.Contains(logs, `"level":"ERROR"`) {
+		t.Errorf("cancellation must not be logged as an error: %s", logs)
+	}
+}
+
+// TestChatCompletions_Streaming_LogsLifecycleEvents checks the happy
+// path emits both lifecycle log events -- stream_started when the SSE
+// connection opens and stream_completed once [DONE] is written --
+// with matching request IDs, so cancelled and completed streams are
+// distinguishable in the logs.
+func TestChatCompletions_Streaming_LogsLifecycleEvents(t *testing.T) {
+	srv, logBuf := newTestServerWithLogBuffer()
+
+	stream := &fakeStreamReader{
+		chunks: []*provider.StreamChunk{{Delta: "hi", FinishReason: "stop"}},
+	}
+	fp := &fakeProvider{
+		name: "fake",
+		chatCompletionStream: func(ctx context.Context, req *provider.ChatRequest) (provider.StreamReader, error) {
+			return stream, nil
+		},
+	}
+
+	rt := router.New()
+	rt.Register("gpt-4o", fp)
+	srv.RegisterChatRoutes(rt)
+
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, `"msg":"stream_started"`) {
+		t.Errorf("logs do not contain a stream_started event: %s", logs)
+	}
+	if !strings.Contains(logs, `"msg":"stream_completed"`) {
+		t.Errorf("logs do not contain a stream_completed event: %s", logs)
+	}
+	if !strings.Contains(logs, `"chunks_emitted":1`) {
+		t.Errorf("stream_completed log does not report chunks_emitted=1: %s", logs)
+	}
+	if strings.Contains(logs, `"msg":"stream_cancelled_by_client"`) {
+		t.Errorf("happy path must not log stream_cancelled_by_client: %s", logs)
 	}
 }

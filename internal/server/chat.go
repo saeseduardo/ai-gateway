@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -83,6 +84,37 @@ func (s *Server) handleChatCompletions(rt *router.Router) http.HandlerFunc {
 // upstream, it emits a ": keep-alive" comment every heartbeat interval
 // so the connection isn't dropped as idle by a proxy, load balancer,
 // or the client itself.
+//
+// Client-side cancellation (the client closes the connection, or its
+// own timeout fires) is the case this function is most careful about:
+// letting the goroutine reading from the provider run on unattended
+// after that would mean continuing to consume — and pay for — tokens
+// nobody will ever receive. Two mechanisms cooperate to prevent that:
+//
+//  1. r.Context() is passed to p.ChatCompletionStream, and both
+//     current provider implementations (openai, anthropic) bind that
+//     same context to their upstream *http.Request via
+//     http.NewRequestWithContext and additionally check ctx.Err() as
+//     a fallback in Recv (see their streamReader.Recv doc comments).
+//     So a well-behaved provider's Recv call will itself return
+//     promptly once r.Context() is cancelled.
+//  2. The select loop below ALSO watches r.Context().Done() directly,
+//     rather than relying solely on (1). This is deliberate, not
+//     redundant: it makes the cutover immediate and deterministic
+//     instead of depending on how quickly a given transport
+//     propagates cancellation into an in-flight Read, and it makes
+//     cancellation handling independent of any single provider
+//     implementation — a StreamReader that doesn't wire up ctx
+//     internally (a test fake, or a future provider) is still cut off
+//     correctly here.
+//
+// Either way, once cancellation is observed the function returns
+// immediately without writing anything further, which runs the
+// deferred stream.Close() — closing the upstream response body and
+// so the TCP connection to the provider — and logs
+// "stream_cancelled_by_client" at Info level: an expected, clean
+// shutdown, not a failure worth an Error log or (were it possible at
+// this point) a 500.
 func (s *Server) streamChatCompletions(w http.ResponseWriter, r *http.Request, p provider.Provider, req *provider.ChatRequest) {
 	sw, err := newSSEWriter(w)
 	if err != nil {
@@ -102,6 +134,7 @@ func (s *Server) streamChatCompletions(w http.ResponseWriter, r *http.Request, p
 
 	reqID := middleware.GetReqID(r.Context())
 	id := "chatcmpl-" + reqID
+	s.logger.Info("stream_started", "request_id", reqID, "model", req.Model)
 
 	heartbeat := s.sseHeartbeatInterval
 	if heartbeat <= 0 {
@@ -110,17 +143,34 @@ func (s *Server) streamChatCompletions(w http.ResponseWriter, r *http.Request, p
 	ticker := time.NewTicker(heartbeat)
 	defer ticker.Stop()
 
+	chunksEmitted := 0
 	next := recvAsync(stream)
 	for {
 		select {
+		case <-r.Context().Done():
+			s.logger.Info("stream_cancelled_by_client",
+				"request_id", reqID,
+				"chunks_emitted", chunksEmitted,
+			)
+			return
+
 		case res := <-next:
 			if res.err == io.EOF {
 				if err := sw.WriteDone(); err != nil {
 					s.logger.Error("stream write failed", "error", err, "request_id", reqID)
+					return
 				}
+				s.logger.Info("stream_completed", "request_id", reqID, "chunks_emitted", chunksEmitted)
 				return
 			}
 			if res.err != nil {
+				if errors.Is(res.err, context.Canceled) || r.Context().Err() != nil {
+					s.logger.Info("stream_cancelled_by_client",
+						"request_id", reqID,
+						"chunks_emitted", chunksEmitted,
+					)
+					return
+				}
 				// Headers and a 200 status are already committed at this
 				// point, so an upstream failure mid-stream can only be
 				// surfaced by logging and closing the connection early —
@@ -134,6 +184,7 @@ func (s *Server) streamChatCompletions(w http.ResponseWriter, r *http.Request, p
 				s.logger.Error("stream write failed", "error", err, "request_id", reqID)
 				return
 			}
+			chunksEmitted++
 			// A real chunk just arrived, so the connection is
 			// demonstrably alive; push the next heartbeat back out
 			// rather than potentially firing one right after this write.
