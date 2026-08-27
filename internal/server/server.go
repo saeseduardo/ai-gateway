@@ -29,6 +29,12 @@ type Server struct {
 	router          chi.Router
 	logger          *slog.Logger
 	shutdownTimeout time.Duration
+
+	// sseHeartbeatInterval is how long an SSE stream (see
+	// streamChatCompletions) can go without a chunk before a keep-alive
+	// heartbeat is sent. Defaults to defaultSSEHeartbeatInterval; tests
+	// override it via SetSSEHeartbeatInterval to use a short interval.
+	sseHeartbeatInterval time.Duration
 }
 
 // New builds a Server from cfg. The returned Server is not yet
@@ -58,10 +64,11 @@ func New(cfg config.ServerConfig, logger *slog.Logger) *Server {
 	}
 
 	return &Server{
-		httpServer:      httpServer,
-		router:          router,
-		logger:          logger,
-		shutdownTimeout: cfg.ShutdownTimeout,
+		httpServer:           httpServer,
+		router:               router,
+		logger:               logger,
+		shutdownTimeout:      cfg.ShutdownTimeout,
+		sseHeartbeatInterval: defaultSSEHeartbeatInterval,
 	}
 }
 
@@ -69,6 +76,14 @@ func New(cfg config.ServerConfig, logger *slog.Logger) *Server {
 // additional routes (e.g. chat completions) after construction.
 func (s *Server) Router() chi.Router {
 	return s.router
+}
+
+// SetSSEHeartbeatInterval overrides the interval between SSE
+// keep-alive heartbeats sent during a slow streaming response
+// (default defaultSSEHeartbeatInterval). It exists mainly so tests can
+// use a short interval instead of waiting on the production default.
+func (s *Server) SetSSEHeartbeatInterval(d time.Duration) {
+	s.sseHeartbeatInterval = d
 }
 
 // Start blocks serving HTTP until the server is shut down or fails.

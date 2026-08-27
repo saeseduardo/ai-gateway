@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
 
@@ -67,15 +68,29 @@ func (s *Server) handleChatCompletions(rt *router.Router) http.HandlerFunc {
 	}
 }
 
-// streamChatCompletions serves the SSE path. It opens the upstream
-// stream first, so a failure (e.g. rate limiting) can still be
-// reported through the normal JSON error path before any bytes of a
-// 200 response are committed. Only once that succeeds does it switch
-// the response into text/event-stream and forward each chunk as an
-// OpenAI-compatible "data: {...}\n\n" line, flushing after every
+// streamChatCompletions serves the SSE path. It validates that w
+// supports flushing and confirms the upstream stream opens
+// successfully before writing anything, so either failure (writer
+// doesn't support streaming, or the provider rejects the request,
+// e.g. rate limiting) can still be reported through the normal JSON
+// error path — no bytes of a 200 response have been committed yet.
+// Only once both checks pass does it flush the SSE headers, so the
+// client's connection is established immediately even if the first
+// chunk takes a while to arrive, then forwards each upstream chunk as
+// an OpenAI-compatible "data: {...}\n\n" frame, flushing after every
 // write so the client receives content incrementally instead of
-// buffered until the handler returns.
+// buffered until the handler returns. While waiting on a slow
+// upstream, it emits a ": keep-alive" comment every heartbeat interval
+// so the connection isn't dropped as idle by a proxy, load balancer,
+// or the client itself.
 func (s *Server) streamChatCompletions(w http.ResponseWriter, r *http.Request, p provider.Provider, req *provider.ChatRequest) {
+	sw, err := newSSEWriter(w)
+	if err != nil {
+		s.logger.Error("streaming not supported by response writer", "error", err)
+		writeError(w, http.StatusInternalServerError, "streaming not supported", "internal_error")
+		return
+	}
+
 	stream, err := p.ChatCompletionStream(r.Context(), req)
 	if err != nil {
 		s.writeProviderError(w, err)
@@ -83,45 +98,78 @@ func (s *Server) streamChatCompletions(w http.ResponseWriter, r *http.Request, p
 	}
 	defer stream.Close()
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "streaming not supported", "internal_error")
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	sw.WriteHeader()
 
 	reqID := middleware.GetReqID(r.Context())
 	id := "chatcmpl-" + reqID
 
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			return
-		}
-		if err != nil {
-			// Headers and a 200 status are already committed at this
-			// point, so an upstream failure mid-stream can only be
-			// surfaced by logging and closing the connection early —
-			// there is no HTTP-level error status left to send.
-			s.logger.Error("stream read failed", "error", err, "request_id", reqID)
-			return
-		}
-
-		data, err := json.Marshal(api.FromProviderStreamChunk(id, req.Model, chunk))
-		if err != nil {
-			s.logger.Error("stream marshal failed", "error", err, "request_id", reqID)
-			return
-		}
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
+	heartbeat := s.sseHeartbeatInterval
+	if heartbeat <= 0 {
+		heartbeat = defaultSSEHeartbeatInterval
 	}
+	ticker := time.NewTicker(heartbeat)
+	defer ticker.Stop()
+
+	next := recvAsync(stream)
+	for {
+		select {
+		case res := <-next:
+			if res.err == io.EOF {
+				if err := sw.WriteDone(); err != nil {
+					s.logger.Error("stream write failed", "error", err, "request_id", reqID)
+				}
+				return
+			}
+			if res.err != nil {
+				// Headers and a 200 status are already committed at this
+				// point, so an upstream failure mid-stream can only be
+				// surfaced by logging and closing the connection early —
+				// there is no HTTP-level error status left to send.
+				s.logger.Error("stream read failed", "error", res.err, "request_id", reqID)
+				return
+			}
+
+			chunk := api.FromProviderStreamChunk(id, req.Model, res.chunk)
+			if err := sw.WriteEvent(chunk); err != nil {
+				s.logger.Error("stream write failed", "error", err, "request_id", reqID)
+				return
+			}
+			// A real chunk just arrived, so the connection is
+			// demonstrably alive; push the next heartbeat back out
+			// rather than potentially firing one right after this write.
+			ticker.Reset(heartbeat)
+			next = recvAsync(stream)
+
+		case <-ticker.C:
+			if err := sw.WriteComment("keep-alive"); err != nil {
+				s.logger.Error("stream heartbeat write failed", "error", err, "request_id", reqID)
+				return
+			}
+		}
+	}
+}
+
+// streamRecvResult is the result of one asynchronous
+// provider.StreamReader.Recv call.
+type streamRecvResult struct {
+	chunk *provider.StreamChunk
+	err   error
+}
+
+// recvAsync calls stream.Recv() in its own goroutine and reports the
+// result on the returned channel. provider.StreamReader.Recv is a
+// blocking call with no channel or context variant, so this is what
+// lets streamChatCompletions wait on it inside a select alongside a
+// heartbeat ticker. The channel is buffered so the goroutine can
+// always send its result and exit even if the caller stops reading
+// (e.g. after a write error ends the stream early).
+func recvAsync(stream provider.StreamReader) <-chan streamRecvResult {
+	ch := make(chan streamRecvResult, 1)
+	go func() {
+		chunk, err := stream.Recv()
+		ch <- streamRecvResult{chunk: chunk, err: err}
+	}()
+	return ch
 }
 
 // writeProviderError maps an error returned by a provider.Provider to

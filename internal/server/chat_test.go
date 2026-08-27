@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/saeseduardo/ai-gateway/internal/api"
 	"github.com/saeseduardo/ai-gateway/internal/provider"
@@ -50,6 +51,33 @@ func (f *fakeStreamReader) Recv() (*provider.StreamChunk, error) {
 
 func (f *fakeStreamReader) Close() error {
 	f.closed = true
+	return nil
+}
+
+// slowStreamReader replays chunks like fakeStreamReader, but sleeps
+// for delays[i] (if present) before returning chunks[i], letting tests
+// simulate a provider that is slow to produce a given chunk.
+type slowStreamReader struct {
+	chunks []*provider.StreamChunk
+	delays []time.Duration
+	idx    int
+	closed bool
+}
+
+func (s *slowStreamReader) Recv() (*provider.StreamChunk, error) {
+	if s.idx < len(s.delays) {
+		time.Sleep(s.delays[s.idx])
+	}
+	if s.idx >= len(s.chunks) {
+		return nil, io.EOF
+	}
+	c := s.chunks[s.idx]
+	s.idx++
+	return c, nil
+}
+
+func (s *slowStreamReader) Close() error {
+	s.closed = true
 	return nil
 }
 
@@ -276,5 +304,138 @@ func TestChatCompletions_ProviderRateLimited(t *testing.T) {
 
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestChatCompletions_Streaming_ResponseWriterWithoutFlusher(t *testing.T) {
+	srv := newTestServer()
+
+	fp := &fakeProvider{
+		name: "fake",
+		chatCompletionStream: func(ctx context.Context, req *provider.ChatRequest) (provider.StreamReader, error) {
+			t.Fatal("provider should not be called once the writer is known not to support flushing")
+			return nil, nil
+		},
+	}
+
+	rt := router.New()
+	rt.Register("gpt-4o", fp)
+	srv.RegisterChatRoutes(rt)
+
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	w := noFlushResponseWriter{ResponseWriter: rec}
+
+	srv.Router().ServeHTTP(w, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var errBody errorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("unmarshal error body: %v", err)
+	}
+	if errBody.Error.Type != "internal_error" {
+		t.Errorf("error.type = %q, want %q", errBody.Error.Type, "internal_error")
+	}
+}
+
+func TestChatCompletions_Streaming_SSEHeaders(t *testing.T) {
+	srv := newTestServer()
+
+	stream := &fakeStreamReader{
+		chunks: []*provider.StreamChunk{{Delta: "hi", FinishReason: "stop"}},
+	}
+	fp := &fakeProvider{
+		name: "fake",
+		chatCompletionStream: func(ctx context.Context, req *provider.ChatRequest) (provider.StreamReader, error) {
+			return stream, nil
+		},
+	}
+
+	rt := router.New()
+	rt.Register("gpt-4o", fp)
+	srv.RegisterChatRoutes(rt)
+
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want %q", got, "text/event-stream")
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("Cache-Control = %q, want %q", got, "no-cache")
+	}
+	if got := rec.Header().Get("Connection"); got != "keep-alive" {
+		t.Errorf("Connection = %q, want %q", got, "keep-alive")
+	}
+	if got := rec.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Errorf("X-Accel-Buffering = %q, want %q", got, "no")
+	}
+}
+
+// TestChatCompletions_Streaming_Heartbeat simulates a provider that
+// takes a while to produce its first chunk, with a short heartbeat
+// interval configured, and verifies at least one SSE comment
+// (": keep-alive") is written before the first data frame -- proving
+// the connection stays active instead of sitting silent (and at risk
+// of an idle timeout) while waiting on a slow upstream.
+func TestChatCompletions_Streaming_Heartbeat(t *testing.T) {
+	srv := newTestServer()
+	srv.SetSSEHeartbeatInterval(10 * time.Millisecond)
+
+	stream := &slowStreamReader{
+		chunks: []*provider.StreamChunk{{Delta: "hi", FinishReason: "stop"}},
+		delays: []time.Duration{60 * time.Millisecond},
+	}
+	fp := &fakeProvider{
+		name: "fake",
+		chatCompletionStream: func(ctx context.Context, req *provider.ChatRequest) (provider.StreamReader, error) {
+			return stream, nil
+		},
+	}
+
+	rt := router.New()
+	rt.Register("gpt-4o", fp)
+	srv.RegisterChatRoutes(rt)
+
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	raw := strings.TrimRight(rec.Body.String(), "\n")
+	var blocks []string
+	for _, b := range strings.Split(raw, "\n\n") {
+		if strings.TrimSpace(b) != "" {
+			blocks = append(blocks, b)
+		}
+	}
+
+	sawHeartbeatBeforeData := false
+	for _, b := range blocks {
+		if strings.HasPrefix(b, ": ") {
+			sawHeartbeatBeforeData = true
+			continue
+		}
+		if strings.HasPrefix(b, "data: ") {
+			break
+		}
+	}
+	if !sawHeartbeatBeforeData {
+		t.Fatalf("no heartbeat comment line found before the first data frame: %q", raw)
+	}
+	if !stream.closed {
+		t.Error("StreamReader was not closed")
 	}
 }
