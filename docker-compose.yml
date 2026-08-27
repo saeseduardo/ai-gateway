@@ -1,0 +1,25 @@
+services:
+  gateway:
+    build: .
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever GATEWAY_REDIS_ADDRESS is set to in .env so the
+      # gateway always reaches the bundled redis service by its DNS name.
+      GATEWAY_REDIS_ADDRESS: redis:6379
+    ports:
+      - "${GATEWAY_SERVER_PORT:-8080}:${GATEWAY_SERVER_PORT:-8080}"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:

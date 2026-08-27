@@ -1,7 +1,8 @@
 // Package config loads typed application configuration for the AI
-// Gateway exclusively from environment variables (prefix GATEWAY_),
-// applying sensible defaults and failing fast on missing or malformed
-// values.
+// Gateway exclusively from environment variables (prefix GATEWAY_,
+// except the provider API keys which follow each provider's own
+// conventional name), applying sensible defaults and failing fast on
+// missing or malformed values.
 package config
 
 import (
@@ -17,11 +18,11 @@ const (
 	envServerIdleTimeout     = "GATEWAY_SERVER_IDLE_TIMEOUT"
 	envServerShutdownTimeout = "GATEWAY_SERVER_SHUTDOWN_TIMEOUT"
 
-	envOpenAIAPIKey  = "GATEWAY_OPENAI_API_KEY"
+	envOpenAIAPIKey  = "OPENAI_API_KEY"
 	envOpenAIBaseURL = "GATEWAY_OPENAI_BASE_URL"
 	envOpenAITimeout = "GATEWAY_OPENAI_TIMEOUT"
 
-	envAnthropicAPIKey  = "GATEWAY_ANTHROPIC_API_KEY"
+	envAnthropicAPIKey  = "ANTHROPIC_API_KEY"
 	envAnthropicBaseURL = "GATEWAY_ANTHROPIC_BASE_URL"
 	envAnthropicTimeout = "GATEWAY_ANTHROPIC_TIMEOUT"
 

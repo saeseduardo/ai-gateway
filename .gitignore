@@ -15,6 +15,7 @@ coverage.html
 # Environment
 .env
 .env.*
+!.env.example
 
 # Go workspace / build cache
 /vendor/
