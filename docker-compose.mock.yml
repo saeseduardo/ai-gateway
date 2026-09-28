@@ -1,0 +1,25 @@
+# Usage: docker compose -f docker-compose.yml -f docker-compose.mock.yml up -d --build
+# This adds a mock Anthropic provider and routes the gateway to it,
+# so you can test streaming cancellation without real API keys.
+services:
+  mock-provider:
+    build: test/mock-provider
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+
+  gateway:
+    depends_on:
+      - mock-provider
+    environment:
+      GATEWAY_ANTHROPIC_BASE_URL: http://mock-provider:8081
+
+  e2e-cancel:
+    build: test/e2e-cancel
+    profiles: [e2e]
+    depends_on:
+      - gateway
+      - mock-provider
+    environment:
+      GATEWAY_URL: http://gateway:8080
+      GATEWAY_MODEL: claude-sonnet-5
