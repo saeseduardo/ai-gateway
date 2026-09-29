@@ -2,7 +2,7 @@
 
 A Go proxy that puts OpenAI and Anthropic behind one OpenAI-compatible API, with streaming that actually stops paying for tokens when the client hangs up.
 
-🚧 **Active work in progress.** Config, both providers, and end-to-end streaming (including cancellation and mid-stream errors) are done and tested. Rate limiting, retries/failover, and observability are not built yet — see [Roadmap](#roadmap).
+🚧 **Active work in progress.** Config, both providers, end-to-end streaming (including cancellation and mid-stream errors), and the resilience utilities (retry with exponential backoff and a circuit breaker, tested under `-race`) are done. The resilience utilities are not wired into request handling yet; rate limiting and observability are not built — see [Roadmap](#roadmap).
 
 ## Why
 
@@ -24,6 +24,7 @@ The gateway is built around one idea: a normalized internal contract (`provider.
   - **Client-side cancellation, end-to-end**: closing the client connection cancels the request context, which is watched explicitly in the streaming loop and is also bound to the upstream provider's HTTP request — the upstream connection is cut immediately instead of the gateway continuing to consume (and pay for) tokens nobody will read. Covered by a dedicated test run repeatedly under `-race`.
   - **Mid-stream error handling**: an upstream failure that happens after the response has already started (status 200 and some frames already sent) is reported as an SSE error frame followed by `[DONE]`, since the HTTP status can no longer change at that point. Clean completion, client cancellation, and mid-stream failure are logged as three distinct events (`stream_completed`, `stream_cancelled_by_client`, `stream_failed`).
 - **Health checks**: `GET /healthz` (liveness) and `GET /readyz` (readiness — currently a stub that always returns ready; see [Roadmap](#roadmap)).
+- **Resilience module** (`internal/resilience`): retry with exponential backoff (capped delay, optional jitter, context-aware — a cancelled context aborts a waiting retry immediately) and a concurrency-safe circuit breaker (Closed/Open/HalfOpen, typed `ErrCircuitOpen`, injectable clock for tests). Built as an isolated, tested package; not yet connected to provider calls.
 - **Structured JSON logging** (`log/slog`) with per-request IDs, panic recovery middleware, and graceful shutdown on `SIGINT`/`SIGTERM`.
 - **Test suite** across every package, run under `go test ./... -race` with no data races.
 
@@ -34,6 +35,7 @@ The gateway is built around one idea: a normalized internal contract (`provider.
 - **Separate HTTP clients per mode, not one client with one timeout.** Both providers build a `Timeout`-bounded client for non-streaming round trips and a second, timeout-free client for streaming, whose lifecycle is governed entirely by the request's context instead. A single client can't correctly express both "a request that hangs should fail fast" and "a streaming response may legitimately stay open far longer than a typical request."
 - **Context propagation is the mechanism for the gateway's central cost property, not an afterthought.** Since streaming tokens are billed per token generated, `r.Context()` is passed into the provider call and is *also* watched explicitly in the streaming select loop — deliberately redundant with the provider-level propagation, so cancellation doesn't depend on every current and future provider implementation wiring up context correctly on its own.
 - **The SSE error frame exists because of a protocol constraint, not a design preference.** Once the 200 status and the first `data:` frame are flushed to the client, the HTTP status can never change — there's no way to turn a streaming response into a 500 partway through. So a mid-stream upstream failure is reported as one final `data:` frame carrying the same `{"error":{"message":...,"type":...}}` shape the non-streaming error path uses, followed by `data: [DONE]\n\n`, so the client can tell "the model finished" from "the stream broke" without a status code.
+- **Fault tolerance first as an isolated, tested package.** The retry/circuit-breaker machinery lives in `internal/resilience` with no dependency on the HTTP layer; only `DefaultIsRetryable` knows the provider error type, via `errors.As`. It is deliberately not wired into the request path yet — the mechanics were proven in isolation under `-race` before integration, so wiring them in later is a contained change.
 
 ## Getting started
 
@@ -134,11 +136,12 @@ Models currently routed (hardcoded in `cmd/gateway/main.go`, see [Roadmap](#road
 - [x] Mid-stream error handling (SSE error frame + `[DONE]`, distinguishable log events)
 - [x] Structured logging, panic recovery, graceful shutdown
 - [x] `docker-compose.yml` for local development
+- [x] Resilience utilities: retry with exponential backoff and circuit breaker (isolated, race-tested)
 
 **Not done yet:**
 - [ ] Config-driven model→provider routing (currently a hardcoded list in `main.go`)
 - [ ] Rate limiting (Redis config already scaffolded; no client or middleware wired up)
-- [ ] Circuit breaker, retries, and provider failover
+- [ ] Wire retry + circuit breaker into provider calls (both exist, isolated and tested), then provider failover
 - [ ] Observability: Prometheus metrics, Grafana dashboards (metrics port reserved, no listener yet)
 - [ ] `/readyz` actually checking Redis/provider connectivity instead of always returning ready
 - [ ] Fix `WriteTimeout` for long-lived streaming responses (see note above)
@@ -149,7 +152,3 @@ Models currently routed (hardcoded in `cmd/gateway/main.go`, see [Roadmap](#road
 - [`github.com/go-chi/chi/v5`](https://github.com/go-chi/chi) v5.3.1 — routing and middleware; the only non-stdlib dependency
 - Standard library for everything else: `net/http`, `encoding/json`, `log/slog`, `context`
 - Docker + Docker Compose for local development
-
-## License
-
-MIT — see `LICENSE`.

@@ -20,6 +20,9 @@ coverage.html
 # Go workspace / build cache
 /vendor/
 
+# Docs
+/docs/
+
 # IDE
 .idea/
 .vscode/
